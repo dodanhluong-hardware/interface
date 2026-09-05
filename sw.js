@@ -1,4 +1,4 @@
-const CACHE_NAME = 'dsp-interface-v19-text-contrast-20260905';
+const CACHE_NAME = 'dsp-interface-v20-fader-cleanup-20260905';
 const ASSETS = [
   './',
   './index.html',
