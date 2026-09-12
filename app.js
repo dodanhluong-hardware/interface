@@ -125,6 +125,7 @@ let bleTxCharacteristic = null;
 let bleManualDisconnect = false;
 let bleReconnectTimer = null;
 let bleReconnectAttempt = 0;
+let bleDisconnectWait = Promise.resolve();
 let configSyncResolve = null;
 let configSyncTimer = null;
 let configSyncExpectedItems = 0;
@@ -133,6 +134,7 @@ let configSyncRevision = 0;
 let saveAckTimer = null;
 let resetAckTimer = null;
 const rxLogLines = [];
+let lastFriendlySystemStatus = '';
 const DB_MIN = -12;
 const DB_MAX = 12;
 const CHART_H = 30;
@@ -479,6 +481,7 @@ async function connectBleWeb() {
   setBleToggleUI();
   setBleLinkState('Đang kết nối BLE Web...');
   setTxStatus('connecting...', 'warn');
+  let selectedDevice = null;
   try {
     const optionalServices = [
       'battery_service',
@@ -487,15 +490,24 @@ async function connectBleWeb() {
       '0000ab00-0000-1000-8000-00805f9b34fb',
       '0000ff00-0000-1000-8000-00805f9b34fb',
     ];
-    const device = await navigator.bluetooth.requestDevice({
-      acceptAllDevices: true,
+    selectedDevice = await navigator.bluetooth.requestDevice({
+      // Firmware khóa tên BLE thương hiệu; chỉ hiện đúng MCU này trong hộp
+      // thoại chọn thiết bị, tránh người dùng chọn nhầm tai nghe/điện thoại.
+      filters: [{ name: 'SoundProgramming' }],
       optionalServices,
     });
-    if (!device) throw new Error('No BLE device selected');
+    if (!selectedDevice) throw new Error('No BLE device selected');
+    await bleDisconnectWait;
+    bleDisconnectWait = Promise.resolve();
 
-    await establishBleConnection(device, 'connected');
+    await establishBleConnection(selectedDevice, 'connected');
   } catch (error) {
     const isCancelled = error?.name === 'NotFoundError';
+    if (selectedDevice?.gatt?.connected) {
+      selectedDevice.removeEventListener('gattserverdisconnected', handleBleDisconnected);
+      if (bleDevice === selectedDevice) bleDevice = null;
+      try { selectedDevice.gatt.disconnect(); } catch (_) { /* already down */ }
+    }
     detachBleRxNotifications();
     detachBleTxCharacteristic();
     applyBleDisconnectedState(isCancelled ? 'Bạn chưa chọn thiết bị BLE' : 'Kết nối BLE thất bại');
@@ -512,10 +524,32 @@ function disconnectBleWeb() {
   clearBleReconnectTimer();
   localStorage.removeItem(BLE_AUTO_RECONNECT_KEY);
   localStorage.removeItem(BLE_DEVICE_ID_KEY);
-  if (bleDevice && bleDevice.gatt?.connected) {
+  const device = bleDevice;
+  if (device && device.gatt?.connected) {
     appendRxLog('Disconnect requested');
-    bleDevice.gatt.disconnect();
+    device.removeEventListener('gattserverdisconnected', handleBleDisconnected);
+    bleDevice = null;
+    bleDisconnectWait = new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        device.removeEventListener('gattserverdisconnected', finish);
+        resolve();
+      };
+      device.addEventListener('gattserverdisconnected', finish);
+      setTimeout(finish, 500);
+      try { device.gatt.disconnect(); } catch (_) { finish(); }
+    });
+    detachBleRxNotifications();
+    detachBleTxCharacteristic();
+    applyBleDisconnectedState('Đã ngắt kết nối BLE Web');
+    setTxStatus('link down', 'bad');
     return;
+  }
+  if (device) {
+    device.removeEventListener('gattserverdisconnected', handleBleDisconnected);
+    bleDevice = null;
   }
   detachBleRxNotifications();
   detachBleTxCharacteristic();
@@ -553,6 +587,21 @@ function formatLogTime() {
 
 function appendRxLog(message) {
   if (!rxLogBox) return;
+  // Nhật ký này dành cho người sử dụng. Các gói debug/ACK/UUID vẫn có thể
+  // xem trong DevTools (console.debug), nhưng không đưa vào màn hình chính.
+  if (/^\[BLE_TRACE\]/.test(message) || /^STATUS #/.test(message) ||
+      /^RX ACK cmd=/.test(message) || /^CONFIG (begin|end)/.test(message) ||
+      /^(RX characteristic found|TX write ready|RX fallback characteristic|TX fallback write ready)/.test(message)) return;
+  if (/^(RX candidate|TX candidate|RX startNotifications failed|RX service enumeration|TX service enumeration)/.test(message)) {
+    message = 'Không khởi tạo được một kênh BLE, đang thử phương án dự phòng';
+  }
+  if (/^RX notify unavailable/.test(message)) message = 'Thiết bị chưa sẵn sàng nhận trạng thái BLE';
+  // Payload thô không có ý nghĩa với người dùng; chỉ giữ các câu lỗi đã dịch.
+  if (/^RX \S+/.test(message)) return;
+  if (/^TX blocked:/.test(message)) message = 'Tạm hoãn gửi lệnh vì thiết bị chưa sẵn sàng';
+  if (/^TX failed:/.test(message)) message = 'Gửi lệnh tới thiết bị thất bại';
+  if (/^SAVE_CONFIG requested/.test(message)) message = 'Đang lưu cài đặt vào thiết bị...';
+  if (/^SAVE_CONFIG timeout/.test(message)) message = 'Thiết bị không xác nhận lưu cài đặt';
   rxLogLines.push(`[${formatLogTime()}] ${message}`);
   if (rxLogLines.length > 500) rxLogLines.shift();
   rxLogBox.textContent = rxLogLines.join('\n');
@@ -561,6 +610,7 @@ function appendRxLog(message) {
 
 function clearRxLog() {
   rxLogLines.length = 0;
+  lastFriendlySystemStatus = '';
   if (!rxLogBox) return;
   rxLogBox.textContent = '[đã xóa]';
 }
@@ -586,45 +636,30 @@ function formatBleSampleRate(sampleRate) {
 
 function decodeBleStatus(value, bytes) {
   if (bytes.length < 15 || bytes[2] !== 1) return null;
-  const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
   const a2dpStates = ['chờ', 'đang kết nối', 'đã kết nối', 'đang phát'];
-  const sampleRate = view.getUint32(4, true);
   const features = bytes[8];
   const dsp = bytes[9];
   const microphones = [];
-  const eq = [];
   const effects = [];
-  const musicDsp = [];
-  const adc = bytes.length >= 20
-    ? `ADC=khung:${bytes[15]} đỉnh1:${view.getUint16(16, true)} đỉnh2:${view.getUint16(18, true)}`
-    : null;
 
   if (features & (1 << 1)) microphones.push('1');
   if (features & (1 << 2)) microphones.push('2');
-  if (dsp & (1 << 0)) eq.push('L');
-  if (dsp & (1 << 1)) eq.push('R');
-  if (dsp & (1 << 2)) eq.push('X');
-  if (dsp & (1 << 3)) eq.push('M1');
-  if (dsp & (1 << 4)) eq.push('M2');
   if (dsp & (1 << 5)) effects.push('echo');
   if (dsp & (1 << 6)) effects.push('reverb');
-  if (dsp & (1 << 7)) effects.push('anti-feedback');
-  if (features & (1 << 6)) musicDsp.push('EQ động');
-  if (features & (1 << 7)) musicDsp.push('DRC');
+  const state = a2dpStates[bytes[3]] || 'đang kiểm tra';
 
   return [
-    `STATUS #${bytes[14]}`,
-    `A2DP=${a2dpStates[bytes[3]] || `state-${bytes[3]}`}`,
-    `Fs=${formatBleSampleRate(sampleRate)}`,
-    `ĐƯỜNG DSP=${features & 1 ? 'bật' : 'tắt'}`,
-    `MIC=${microphones.length ? microphones.join('+') : 'tắt'}`,
-    `SUB=${features & (1 << 3) ? 'bật' : 'tắt'}`,
-    `EQ=${eq.length ? eq.join(',') : 'tắt'}`,
-    `HIỆU ỨNG=${effects.length ? effects.join(',') : 'tắt'}`,
-    `DSP NHẠC=${musicDsp.length ? musicDsp.join(',') : 'tắt'}`,
-    `ÂM LƯỢNG=${bytes[10]}/${bytes[11]}/${bytes[12]}/${bytes[13]}%`,
-    adc,
-  ].filter(Boolean).join(' ');
+    `Bluetooth: ${state}`,
+    `Âm thanh: ${features & 1 ? 'sẵn sàng' : 'đang chuẩn bị'}`,
+    `Micro: ${microphones.length ? 'đang bật' : 'đang tắt'}`,
+    effects.length ? 'Hiệu ứng âm thanh đang bật' : 'Hiệu ứng âm thanh đang tắt',
+  ].join(' · ');
+}
+
+function appendFriendlySystemStatus(message) {
+  if (!message || message === lastFriendlySystemStatus) return;
+  lastFriendlySystemStatus = message;
+  appendRxLog(`Trạng thái hệ thống: ${message}`);
 }
 
 function setControlValueFromMcu(id, value) {
@@ -779,7 +814,6 @@ function handleBleRxNotification(event) {
       } else {
         setTxStatus(ok ? 'đã xác nhận' : `xác nhận lỗi ${bytes[3]}`, ok ? 'ok' : 'bad');
       }
-      appendRxLog(`RX ACK cmd=0x${bytes[2].toString(16).padStart(2, '0')} status=${bytes[3]}`);
       if (command === DSP_CMD_GET_CONFIG && !ok) {
         finishDspConfigSync(false, `MCU từ chối đọc cấu hình, mã lỗi=${bytes[3]}`);
       }
@@ -787,7 +821,7 @@ function handleBleRxNotification(event) {
     }
     if (bytes[0] === 0xa5 && bytes[1] === 0x81) {
       const status = decodeBleStatus(value, bytes);
-      appendRxLog(status || `Trạng thái không hỗ trợ (${bytes.length} byte)`);
+      if (status) appendFriendlySystemStatus(status);
       return;
     }
     if (bytes[0] === 0xa5 && bytes[1] === DSP_EVENT_CONFIG_BEGIN && bytes.length === 8) {
@@ -795,7 +829,7 @@ function handleBleRxNotification(event) {
       configSyncExpectedItems = bytes[3];
       configSyncReceivedItems = 0;
       configSyncRevision = view.getUint32(4, true);
-      appendRxLog(`CONFIG begin v${bytes[2]} items=${configSyncExpectedItems} rev=${configSyncRevision}`);
+      appendRxLog('Đang nhận cài đặt từ thiết bị...');
       return;
     }
     if (bytes[0] === 0xa5 && bytes[1] === DSP_EVENT_CONFIG_ITEM) {
@@ -809,12 +843,12 @@ function handleBleRxNotification(event) {
       renderMcuConfigOnInterface();
       setTxStatus(status === 0 ? 'đồng bộ MCU' : `sync lỗi ${status}`, status === 0 ? 'ok' : 'bad');
       finishDspConfigSync(status === 0,
-        `CONFIG end items=${configSyncReceivedItems}/${configSyncExpectedItems} rev=${revision}`);
+        status === 0 ? 'Đã đồng bộ cài đặt với thiết bị' : 'Không đồng bộ được cài đặt với thiết bị');
       return;
     }
   }
   const payload = decodeRxValue(value);
-  appendRxLog(`RX ${payload || '(empty)'}`);
+  console.debug('[BLE_RX_RAW]', payload || '(empty)');
 }
 
 function detachBleRxNotifications() {
@@ -1164,7 +1198,7 @@ async function requestDspConfigFromChip() {
   configSyncExpectedItems = 0;
   configSyncReceivedItems = 0;
   configSyncRevision = 0;
-  appendRxLog('Requesting DSP configuration from MCU...');
+  appendRxLog('Đang tải thông số thiết bị...');
 
   const completion = new Promise((resolve) => {
     configSyncResolve = resolve;

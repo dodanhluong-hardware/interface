@@ -1,4 +1,4 @@
-const CACHE_NAME = 'dsp-interface-v20-fader-cleanup-20260905';
+const CACHE_NAME = 'dsp-interface-v26-gatt-disconnect-20260906';
 const ASSETS = [
   './',
   './index.html',
